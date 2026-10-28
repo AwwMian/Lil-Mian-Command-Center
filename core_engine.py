@@ -25,6 +25,7 @@ YOUTUBE_API_KEY = clean_env("YOUTUBE_API_KEY")
 YOUTUBE_HANDLE = "@NotAwwMian"
 IG_HANDLE = "@awwmianlive"
 GEMINI_KEY = clean_env("GEMINI_API_KEY")
+TWITTER_USERNAME = clean_env("TWITTER_USERNAME", "tei_0415").lstrip("@")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "awwmian_vault.db")
 
@@ -48,6 +49,7 @@ def init_db() -> None:
             twitch_channel_id INTEGER,
             yt_channel_id INTEGER,
             shorts_channel_id INTEGER,
+            twitter_channel_id INTEGER,
             mod_log_channel_id INTEGER,
             roles_channel_id INTEGER,
             rules_channel_id INTEGER,
@@ -62,6 +64,7 @@ def init_db() -> None:
             stream_ping_role_id INTEGER,
             yt_ping_role_id INTEGER,
             shorts_ping_role_id INTEGER,
+            twitter_ping_role_id INTEGER,
             live_streamer_role_id INTEGER,
             lvl5_role_id INTEGER,
             lvl10_role_id INTEGER,
@@ -73,6 +76,12 @@ def init_db() -> None:
     c.execute("""
         CREATE TABLE IF NOT EXISTS posted_videos (
             video_id TEXT PRIMARY KEY,
+            published_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS posted_tweets (
+            tweet_id TEXT PRIMARY KEY,
             published_at TEXT
         )
     """)
@@ -91,7 +100,7 @@ def init_db() -> None:
             guild_id INTEGER,
             user_id INTEGER,
             xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
             PRIMARY KEY (guild_id, user_id)
         )
     """)
@@ -99,8 +108,12 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS economy (
             guild_id INTEGER,
             user_id INTEGER,
-            balance INTEGER DEFAULT 100,
+            balance INTEGER DEFAULT 25,
             bank INTEGER DEFAULT 0,
+            bank_max INTEGER DEFAULT 1000,
+            xp_boost_mult REAL DEFAULT 1.0,
+            xp_boost_until REAL DEFAULT 0,
+            padlocks INTEGER DEFAULT 0,
             last_daily REAL DEFAULT 0,
             last_weekly REAL DEFAULT 0,
             last_monthly REAL DEFAULT 0,
@@ -116,22 +129,36 @@ init_db()
 async def init_async_db() -> None:
     init_db()
     async with aiosqlite.connect(DB_PATH) as db:
-        new_cols = [
+        new_guild_cols = [
             "rules_channel_id", "announcements_channel_id",
             "joins_channel_id", "leaves_channel_id",
             "verify_channel_id", "feedback_channel_id",
-            "memes_channel_id", "clips_channel_id", "verified_role_id"
+            "memes_channel_id", "clips_channel_id", "verified_role_id",
+            "twitter_channel_id", "twitter_ping_role_id"
         ]
-        for col in new_cols:
+        for col in new_guild_cols:
             try:
                 await db.execute(f"ALTER TABLE guild_config ADD COLUMN {col} INTEGER")
             except Exception:
                 pass
-        for econ_col in ["last_daily", "last_weekly", "last_monthly"]:
+
+        econ_migrations = [
+            ("last_daily", "REAL DEFAULT 0"),
+            ("last_weekly", "REAL DEFAULT 0"),
+            ("last_monthly", "REAL DEFAULT 0"),
+            ("bank_max", "INTEGER DEFAULT 1000"),
+            ("xp_boost_mult", "REAL DEFAULT 1.0"),
+            ("xp_boost_until", "REAL DEFAULT 0"),
+            ("padlocks", "INTEGER DEFAULT 0")
+        ]
+        for col, col_type in econ_migrations:
             try:
-                await db.execute(f"ALTER TABLE economy ADD COLUMN {econ_col} REAL DEFAULT 0")
+                await db.execute(f"ALTER TABLE economy ADD COLUMN {col} {col_type}")
             except Exception:
                 pass
+
+        # Automatically upgrade anyone stuck at Level 0 to Level 1
+        await db.execute("UPDATE user_xp SET level = 1 WHERE level < 1")
         await db.commit()
 
 def save_clip_idea(idea_text: str, source: str = "Discord Remote") -> None:
@@ -165,12 +192,18 @@ def delete_idea(idea_id: int) -> None:
 # 1. STREAM SCHEDULE ENGINE (JST / GMT+9 ONLY)
 # ==========================================
 def get_next_stream_info() -> dict:
+    """
+    Calculates schedule & countdown strictly in Japan Standard Time (GMT+9):
+    - Wed 6:00 PM - 8:45 PM IST  --> Wed 9:30 PM - 12:15 AM JST
+    - Fri 8:45 PM - 11:15 PM IST --> Sat 12:15 AM - 2:45 AM JST (Friday Late Night)
+    - Sun 2:00 PM - 4:30 PM IST  --> Sun 5:30 PM - 8:00 PM JST
+    """
     jst = pytz.timezone("Asia/Tokyo")
     now_jst = datetime.datetime.now(jst)
     schedule = [
-        (2, 21, 30, 165, "Wednesday Night Stream (9:30 PM - 12:15 AM) JST"),
-        (5, 0, 15, 150, "Friday Late Night Stream (12:15 AM - 2:45 AM) JST"),
-        (6, 17, 30, 150, "Sunday Evening Stream (5:30 PM - 8:00 PM) JST")
+        (2, 21, 30, 165, "Wednesday Night Stream (9:30 PM - 12:15 AM) JST / Japan Time"),
+        (5, 0, 15, 150, "Friday Late Night Stream (12:15 AM - 2:45 AM) JST / Japan Time"),
+        (6, 17, 30, 150, "Sunday Evening Stream (5:30 PM - 8:00 PM) JST / Japan Time")
     ]
     upcoming = []
     for weekday, sh, sm, duration_mins, label in schedule:
@@ -337,9 +370,10 @@ def generate_ideas_and_predictions(custom_focus: str = "VALORANT & osu!") -> str
     3. 🟣 1 Interactive Twitch Stream Segment for Twitch.tv/AwwMian's next JST broadcast that gets chat spamming.
     4. 🔮 14-DAY META PREDICTION: Predict the next viral crossover trend between rhythm games (osu!) and tactical shooters (VALORANT) and how to film it today.
     """
-    if GEMINI_KEY and GEMINI_KEY != "your_gemini_key_here":
+    api_key = clean_env("GEMINI_API_KEY")
+    if api_key and api_key != "your_gemini_key_here":
         try:
-            client = genai.Client(api_key=GEMINI_KEY)
+            client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt
@@ -349,6 +383,9 @@ def generate_ideas_and_predictions(custom_focus: str = "VALORANT & osu!") -> str
             return f"⚠️ Gemini API Error: {e}"
     return "⚠️ Please verify your GEMINI_API_KEY in `.env` or Streamlit Secrets!"
 
+# ==========================================
+# 5. REMOTE WINDOWS PC STREAM PREP LAUNCHER
+# ==========================================
 def trigger_windows_stream_prep() -> list:
     launched = []
     try:

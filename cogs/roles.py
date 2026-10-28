@@ -153,6 +153,10 @@ class RoleAssignmentView(discord.ui.View):
     async def btn_minor(self, interaction: discord.Interaction, button: discord.ui.Button):
         await toggle_member_role(interaction, "🌱 Minor (<18)", discord.Color.from_rgb(82, 183, 136))
 
+    @discord.ui.button(label="Twitter Ping", emoji="🐦", style=discord.ButtonStyle.primary, row=0, custom_id="persistent:twitter_ping")
+    async def btn_twitter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await toggle_member_role(interaction, "🐦 Twitter Ping", discord.Color.from_rgb(29, 161, 242))
+        
     # ROW 2: Core Games
     @discord.ui.button(label="VALORANT", emoji="🎯", style=discord.ButtonStyle.danger, row=2, custom_id="persistent:game_val")
     async def btn_val(self, interaction: discord.Interaction, button: discord.ui.Button):
