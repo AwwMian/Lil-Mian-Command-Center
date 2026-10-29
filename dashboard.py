@@ -7,26 +7,9 @@ import subprocess
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-import core_engine as engine
 
 load_dotenv(override=True)
-
-# ==========================================
-# CLOUD 24/7 DISCORD BOT AUTO-LAUNCHER
-# Automatically starts bot.py on Linux Cloud Servers!
-# ==========================================
-@st.cache_resource
-def ensure_cloud_bot_running():
-    # Only auto-spawn in the background when hosted on Linux Cloud (Streamlit Cloud)
-    # so it never collides with start_app.bat on your Windows PC!
-    if sys.platform != "win32":
-        for key in ["DISCORD_BOT_TOKEN", "GEMINI_API_KEY", "TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "TWITCH_CHANNEL", "YOUTUBE_API_KEY", "DASHBOARD_PASSKEY"]:
-            if key in st.secrets:
-                os.environ[key] = str(st.secrets[key])
-        return subprocess.Popen([sys.executable, "bot.py"], env=os.environ.copy())
-    return None
-
-ensure_cloud_bot_running()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 st.set_page_config(
     page_title="AwwMian // Command Center",
@@ -35,16 +18,44 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==========================================
-# DYNAMIC SHA-256 ENCRYPTED GATEKEEPER
-# Reads from .env locally or Streamlit Secrets in Cloud
-# ==========================================
+def safe_get_secret(key: str, default: str = "") -> str:
+    """Safely reads from .env or st.secrets without EVER throwing a Streamlit crash!"""
+    val = os.getenv(key, "")
+    if val:
+        return val.strip().strip('"').strip("'")
+    try:
+        val = st.secrets.get(key, default)
+        if val:
+            os.environ[key] = str(val)
+            return str(val).strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return default
+
+# Pre-load cloud secrets into os.environ BEFORE importing core_engine
+for _k in [
+    "DISCORD_BOT_TOKEN", "GEMINI_API_KEY", "TWITCH_CLIENT_ID",
+    "TWITCH_CLIENT_SECRET", "TWITCH_CHANNEL", "YOUTUBE_API_KEY",
+    "YOUTUBE_CHANNEL_ID", "DASHBOARD_PASSKEY", "TWITTER_USERNAME"
+]:
+    safe_get_secret(_k)
+
+import core_engine as engine
+sys.modules["database"] = engine
+
+@st.cache_resource
+def ensure_cloud_bot_running():
+    if sys.platform != "win32":
+        try:
+            return subprocess.Popen([sys.executable, "bot.py"], env=os.environ.copy())
+        except Exception:
+            return None
+    return None
+
+ensure_cloud_bot_running()
+
 def verify_passkey(entered_password: str) -> bool:
-    secret_target = os.getenv("DASHBOARD_PASSKEY", "")
-    if not secret_target and "DASHBOARD_PASSKEY" in st.secrets:
-        secret_target = str(st.secrets["DASHBOARD_PASSKEY"])
-    secret_target = secret_target.strip().strip('"').strip("'")
-    
+    secret_target = safe_get_secret("DASHBOARD_PASSKEY", "IRIS@*6769@AwwMian2007#59255925")
     clean_input = entered_password.strip()
     input_hash = hashlib.sha256(clean_input.encode("utf-8")).hexdigest()
     target_hash = hashlib.sha256(secret_target.encode("utf-8")).hexdigest()
@@ -145,9 +156,6 @@ if not st.session_state.authenticated:
                     st.error("⛔ Invalid Master Passkey. Access Denied.")
     st.stop()
 
-# ==========================================
-# CACHED NON-BLOCKING DATA FETCHERS
-# ==========================================
 @st.cache_data(ttl=90, show_spinner=False)
 def cached_social_stats():
     return engine.get_social_stats()
@@ -165,9 +173,6 @@ def get_db_table(query: str, params=()):
     except Exception:
         return pd.DataFrame()
 
-# ==========================================
-# MAIN AUTHENTICATED DASHBOARD
-# ==========================================
 sched = engine.get_next_stream_info()
 stats = cached_social_stats()
 
@@ -187,15 +192,15 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 df_xp = get_db_table("SELECT user_id, level, xp FROM user_xp ORDER BY level DESC, xp DESC")
-df_econ = get_db_table("SELECT user_id, balance FROM economy ORDER BY balance DESC")
-total_miancoins = int(df_econ["balance"].sum()) if not df_econ.empty else 0
+df_econ = get_db_table("SELECT user_id, balance, bank, padlocks FROM economy ORDER BY (balance + bank) DESC")
+total_miancoins = int((df_econ["balance"] + df_econ["bank"]).sum()) if not df_econ.empty else 0
 
 c1, c2, c3, c4, c5 = st.columns(5)
 cards = [
     (c1, "🟣 TWITCH STATUS", stats["twitch_status"], f"Playing: {stats['twitch_game']}"),
     (c2, "👥 TWITCH FOLLOWERS", f"{stats['twitch_followers']:,}", "twitch.tv/AwwMian"),
     (c3, "🔴 YOUTUBE (@NotAwwMian)", f"{stats['yt_subscribers']:,} Subs", f"{stats['yt_total_views']:,} Views • {stats['yt_video_count']} Vids"),
-    (c4, "📸 INSTAGRAM REELS", stats["ig_handle"], "Short-Form Feed Active"),
+    (c4, "📸 INSTAGRAM & TWITTER", f"{stats['ig_handle']} • @{engine.TWITTER_USERNAME}", "Auto-Feeds Active"),
     (c5, "🌸 SERVER ECONOMY", f"{total_miancoins:,} Coins", f"{len(df_xp)} Ranked Discord Members")
 ]
 
@@ -270,7 +275,7 @@ with tab_discord:
         with st.container(border=True):
             st.subheader("🌸 Richest MianCoin Holders")
             if df_econ.empty:
-                st.caption("No MianCoins claimed yet. Run `/daily` or `/weekly` in Discord!")
+                st.caption("No MianCoins claimed yet. Chat or run `/daily` in Discord!")
             else:
                 st.dataframe(df_econ, use_container_width=True, hide_index=True)
     with d_col3:

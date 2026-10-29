@@ -1,335 +1,537 @@
 import os
-import sys
-import hmac
-import hashlib
+import time
 import sqlite3
+import datetime
 import subprocess
-import pandas as pd
-import streamlit as st
+import webbrowser
+import xml.etree.ElementTree as ET
+from typing import Optional, Dict, Any, List, Tuple
+import requests
+import pytz
+import aiosqlite
 from dotenv import load_dotenv
-import core_engine as engine
+from google import genai
+from core_engine import *
 
 load_dotenv(override=True)
 
-st.set_page_config(
-    page_title="AwwMian // Command Center",
-    page_icon="🌸",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+def clean_env(key: str, default: str = "") -> str:
+    val = os.getenv(key, default)
+    return val.strip().strip('"').strip("'") if val else default
+
+TWITCH_CHANNEL = clean_env("TWITCH_CHANNEL", "AwwMian")
+TWITCH_CLIENT_ID = clean_env("TWITCH_CLIENT_ID")
+TWITCH_CLIENT_SECRET = clean_env("TWITCH_CLIENT_SECRET")
+YOUTUBE_API_KEY = clean_env("YOUTUBE_API_KEY")
+YOUTUBE_HANDLE = "@NotAwwMian"
+IG_HANDLE = "@awwmianlive"
+GEMINI_KEY = clean_env("GEMINI_API_KEY")
+TWITTER_USERNAME = clean_env("TWITTER_USERNAME", "tei_0415").lstrip("@")
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "awwmian_vault.db")
 
 # ==========================================
-# CLOUD 24/7 DISCORD BOT AUTO-LAUNCHER
-# Automatically starts bot.py on Linux Cloud Servers!
+# 0. UNIFIED SYNC & ASYNC SQLITE ENGINE
 # ==========================================
-@st.cache_resource
-def ensure_cloud_bot_running():
-    if sys.platform != "win32":
-        secret_keys = [
-            "DISCORD_BOT_TOKEN", "GEMINI_API_KEY", "TWITCH_CLIENT_ID",
-            "TWITCH_CLIENT_SECRET", "TWITCH_CHANNEL", "YOUTUBE_API_KEY",
-            "YOUTUBE_CHANNEL_ID", "DASHBOARD_PASSKEY", "TWITTER_USERNAME"
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS idea_vault (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            source TEXT,
+            idea TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS guild_config (
+            guild_id INTEGER PRIMARY KEY,
+            twitch_channel_id INTEGER,
+            yt_channel_id INTEGER,
+            shorts_channel_id INTEGER,
+            twitter_channel_id INTEGER,
+            mod_log_channel_id INTEGER,
+            roles_channel_id INTEGER,
+            rules_channel_id INTEGER,
+            announcements_channel_id INTEGER,
+            joins_channel_id INTEGER,
+            leaves_channel_id INTEGER,
+            verify_channel_id INTEGER,
+            feedback_channel_id INTEGER,
+            memes_channel_id INTEGER,
+            clips_channel_id INTEGER,
+            verified_role_id INTEGER,
+            stream_ping_role_id INTEGER,
+            yt_ping_role_id INTEGER,
+            shorts_ping_role_id INTEGER,
+            twitter_ping_role_id INTEGER,
+            live_streamer_role_id INTEGER,
+            lvl5_role_id INTEGER,
+            lvl10_role_id INTEGER,
+            lvl25_role_id INTEGER,
+            lvl50_role_id INTEGER,
+            is_currently_live INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS posted_videos (
+            video_id TEXT PRIMARY KEY,
+            published_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS posted_tweets (
+            tweet_id TEXT PRIMARY KEY,
+            published_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            user_id INTEGER,
+            moderator_id INTEGER,
+            reason TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_xp (
+            guild_id INTEGER,
+            user_id INTEGER,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS economy (
+            guild_id INTEGER,
+            user_id INTEGER,
+            balance INTEGER DEFAULT 25,
+            bank INTEGER DEFAULT 0,
+            bank_max INTEGER DEFAULT 1000,
+            xp_boost_mult REAL DEFAULT 1.0,
+            xp_boost_until REAL DEFAULT 0,
+            padlocks INTEGER DEFAULT 0,
+            last_daily REAL DEFAULT 0,
+            last_weekly REAL DEFAULT 0,
+            last_monthly REAL DEFAULT 0,
+            inventory TEXT DEFAULT '',
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+async def init_async_db() -> None:
+    init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        new_guild_cols = [
+            "rules_channel_id", "announcements_channel_id",
+            "joins_channel_id", "leaves_channel_id",
+            "verify_channel_id", "feedback_channel_id",
+            "memes_channel_id", "clips_channel_id", "verified_role_id",
+            "twitter_channel_id", "twitter_ping_role_id"
         ]
-        for key in secret_keys:
+        for col in new_guild_cols:
             try:
-                if key in st.secrets:
-                    os.environ[key] = str(st.secrets[key])
+                await db.execute(f"ALTER TABLE guild_config ADD COLUMN {col} INTEGER")
             except Exception:
                 pass
-        return subprocess.Popen([sys.executable, "bot.py"], env=os.environ.copy())
-    return None
 
-ensure_cloud_bot_running()
+        econ_migrations = [
+            ("last_daily", "REAL DEFAULT 0"),
+            ("last_weekly", "REAL DEFAULT 0"),
+            ("last_monthly", "REAL DEFAULT 0"),
+            ("bank_max", "INTEGER DEFAULT 1000"),
+            ("xp_boost_mult", "REAL DEFAULT 1.0"),
+            ("xp_boost_until", "REAL DEFAULT 0"),
+            ("padlocks", "INTEGER DEFAULT 0")
+        ]
+        for col, col_type in econ_migrations:
+            try:
+                await db.execute(f"ALTER TABLE economy ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass
+
+        await db.execute("UPDATE user_xp SET level = 1 WHERE level < 1")
+        await db.commit()
 
 # ==========================================
-# DYNAMIC SHA-256 ENCRYPTED GATEKEEPER
+# ALL ASYNC DATABASE HELPERS (BUILT RIGHT IN!)
 # ==========================================
-def verify_passkey(entered_password: str) -> bool:
-    secret_target = os.getenv("DASHBOARD_PASSKEY", "")
-    if not secret_target:
+async def get_guild_config(guild_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def save_guild_config(guild_id: int, **kwargs: Any) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        existing = await get_guild_config(guild_id)
+        if not existing:
+            await db.execute("INSERT INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+        for col, val in kwargs.items():
+            await db.execute(f"UPDATE guild_config SET {col} = ? WHERE guild_id = ?", (val, guild_id))
+        await db.commit()
+
+async def is_video_posted(video_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM posted_videos WHERE video_id = ?", (video_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def mark_video_posted(video_id: str, published_at: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO posted_videos (video_id, published_at) VALUES (?, ?)", (video_id, published_at))
+        await db.commit()
+
+async def is_tweet_posted(tweet_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM posted_tweets WHERE tweet_id = ?", (tweet_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def mark_tweet_posted(tweet_id: str, published_at: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO posted_tweets (tweet_id, published_at) VALUES (?, ?)", (tweet_id, published_at))
+        await db.commit()
+
+async def add_warning(guild_id: int, user_id: int, moderator_id: int, reason: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warnings (guild_id, user_id, moderator_id, reason) VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, moderator_id, reason)
+        )
+        await db.commit()
+        async with db.execute("SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 1
+
+async def get_warnings(guild_id: int, user_id: int) -> List[Tuple[Any, ...]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, moderator_id, reason, timestamp FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC",
+            (guild_id, user_id)
+        ) as cur:
+            return await cur.fetchall()
+
+async def ensure_economy_user(guild_id: int, user_id: int) -> Dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM economy WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                await db.execute("INSERT INTO economy (guild_id, user_id, balance, bank, bank_max) VALUES (?, ?, 25, 0, 1000)", (guild_id, user_id))
+                await db.commit()
+                async with db.execute("SELECT * FROM economy WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)) as cur2:
+                    row = await cur2.fetchone()
+            return dict(row)
+
+async def get_balance(guild_id: int, user_id: int) -> int:
+    data = await ensure_economy_user(guild_id, user_id)
+    return data["balance"]
+
+async def update_balance(guild_id: int, user_id: int, amount_delta: int) -> int:
+    data = await ensure_economy_user(guild_id, user_id)
+    new_bal = max(0, data["balance"] + amount_delta)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE economy SET balance = ? WHERE guild_id = ? AND user_id = ?", (new_bal, guild_id, user_id))
+        await db.commit()
+    return new_bal
+
+async def get_user_level(guild_id: int, user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT level FROM user_xp WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)) as cur:
+            row = await cur.fetchone()
+            return max(1, row[0]) if row else 1
+
+async def get_active_xp_multiplier(guild_id: int, user_id: int) -> Tuple[float, int]:
+    data = await ensure_economy_user(guild_id, user_id)
+    now = time.time()
+    until = float(data.get("xp_boost_until") or 0)
+    mult = float(data.get("xp_boost_mult") or 1.0)
+    if until > now and mult > 1.0:
+        return mult, int(until - now)
+    return 1.0, 0
+
+async def activate_xp_booster(guild_id: int, user_id: int, mult: float, duration_seconds: int) -> int:
+    data = await ensure_economy_user(guild_id, user_id)
+    now = time.time()
+    current_until = float(data.get("xp_boost_until") or 0)
+    base_time = max(now, current_until)
+    new_until = base_time + duration_seconds
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE economy SET xp_boost_mult = ?, xp_boost_until = ? WHERE guild_id = ? AND user_id = ?",
+            (mult, new_until, guild_id, user_id)
+        )
+        await db.commit()
+    return int(new_until - now)
+
+async def claim_timed_reward(guild_id: int, user_id: int, period: str, reward: int, cooldown_seconds: int) -> Tuple[bool, int, int]:
+    data = await ensure_economy_user(guild_id, user_id)
+    now = time.time()
+    last_claim = float(data.get(period) or 0.0)
+    elapsed = now - last_claim
+    if elapsed < cooldown_seconds:
+        return False, int(cooldown_seconds - elapsed), reward
+
+    new_bal = data["balance"] + reward
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE economy SET balance = ?, {period} = ? WHERE guild_id = ? AND user_id = ?",
+            (new_bal, now, guild_id, user_id)
+        )
+        await db.commit()
+    return True, new_bal, reward
+
+async def reset_guild_economy(guild_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE economy SET balance = 25, bank = 0, bank_max = 1000, padlocks = 0, last_daily = 0, last_weekly = 0, last_monthly = 0 WHERE guild_id = ?",
+            (guild_id,)
+        )
+        await db.commit()
+
+def save_clip_idea(idea_text: str, source: str = "Discord Remote") -> None:
+    init_db()
+    jst = pytz.timezone("Asia/Tokyo")
+    now_str = datetime.datetime.now(jst).strftime("%b %d, %I:%M %p JST")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO idea_vault (timestamp, source, idea) VALUES (?, ?, ?)", (now_str, source, idea_text))
+    conn.commit()
+    conn.close()
+
+def get_saved_ideas(limit: int = 10):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, timestamp, source, idea FROM idea_vault ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def delete_idea(idea_id: int) -> None:
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM idea_vault WHERE id = ?", (idea_id,))
+    conn.commit()
+    conn.close()
+
+# ==========================================
+# 1. STREAM SCHEDULE ENGINE (JST / GMT+9 ONLY)
+# ==========================================
+def get_next_stream_info() -> dict:
+    jst = pytz.timezone("Asia/Tokyo")
+    now_jst = datetime.datetime.now(jst)
+    schedule = [
+        (2, 21, 30, 165, "Wednesday Night Stream (9:30 PM - 12:15 AM) JST / Japan Time"),
+        (5, 0, 15, 150, "Friday Late Night Stream (12:15 AM - 2:45 AM) JST / Japan Time"),
+        (6, 17, 30, 150, "Sunday Evening Stream (5:30 PM - 8:00 PM) JST / Japan Time")
+    ]
+    upcoming = []
+    for weekday, sh, sm, duration_mins, label in schedule:
+        days_ahead = weekday - now_jst.weekday()
+        start_time = (now_jst + datetime.timedelta(days=days_ahead)).replace(
+            hour=sh, minute=sm, second=0, microsecond=0
+        )
+        end_time = start_time + datetime.timedelta(minutes=duration_mins)
+        if start_time <= now_jst <= end_time:
+            remaining = end_time - now_jst
+            rem_h, rem_m = divmod(remaining.seconds // 60, 60)
+            return {
+                "status": "🟢 LIVE WINDOW NOW",
+                "label": label,
+                "next_date": "LIVE NOW (JST / GMT+9)",
+                "countdown": f"In Broadcast Window! ({rem_h}h {rem_m}m left)"
+            }
+        if start_time < now_jst:
+            start_time += datetime.timedelta(days=7)
+        upcoming.append((start_time, label))
+
+    upcoming.sort(key=lambda x: x[0])
+    next_stream_time, next_label = upcoming[0]
+    diff = next_stream_time - now_jst
+    days = diff.days
+    hours, remainder = divmod(diff.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    return {
+        "status": "UPCOMING",
+        "label": next_label,
+        "next_date": next_stream_time.strftime("%A, %b %d at %I:%M %p JST (GMT+9)"),
+        "countdown": f"{days}d {hours}h {minutes}m"
+    }
+
+# ==========================================
+# 2. REAL-TIME SOCIAL STATS (FAST NON-BLOCKING)
+# ==========================================
+def get_social_stats() -> dict:
+    stats = {
+        "twitch_channel": f"twitch.tv/{TWITCH_CHANNEL}",
+        "twitch_status": "Offline",
+        "twitch_viewers": 0,
+        "twitch_followers": 0,
+        "twitch_game": "VALORANT / osu!",
+        "yt_handle": YOUTUBE_HANDLE,
+        "yt_subscribers": 0,
+        "yt_total_views": 0,
+        "yt_video_count": 0,
+        "ig_handle": IG_HANDLE
+    }
+    try:
+        uptime_resp = requests.get(f"https://decapi.me/twitch/uptime/{TWITCH_CHANNEL}", timeout=2.5).text
+        if "offline" not in uptime_resp.lower() and "error" not in uptime_resp.lower():
+            stats["twitch_status"] = f"🟢 LIVE ({uptime_resp})"
+            viewers = requests.get(f"https://decapi.me/twitch/viewercount/{TWITCH_CHANNEL}", timeout=2.5).text
+            stats["twitch_viewers"] = int(viewers) if viewers.isdigit() else 0
+            game = requests.get(f"https://decapi.me/twitch/game/{TWITCH_CHANNEL}", timeout=2.5).text
+            stats["twitch_game"] = game
+        follow_count = requests.get(f"https://decapi.me/twitch/followcount/{TWITCH_CHANNEL}", timeout=2.5).text
+        if follow_count.isdigit():
+            stats["twitch_followers"] = int(follow_count)
+    except Exception:
+        pass
+
+    if YOUTUBE_API_KEY and YOUTUBE_API_KEY != "your_youtube_api_key":
         try:
-            if "DASHBOARD_PASSKEY" in st.secrets:
-                secret_target = str(st.secrets["DASHBOARD_PASSKEY"])
+            yt_url = f"https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&forHandle={YOUTUBE_HANDLE}&key={YOUTUBE_API_KEY}"
+            resp = requests.get(yt_url, timeout=3.0).json()
+            if "items" in resp and len(resp["items"]) > 0:
+                yt_stats = resp["items"][0]["statistics"]
+                stats["yt_subscribers"] = int(yt_stats.get("subscriberCount", 0))
+                stats["yt_total_views"] = int(yt_stats.get("viewCount", 0))
+                stats["yt_video_count"] = int(yt_stats.get("videoCount", 0))
         except Exception:
             pass
-    secret_target = secret_target.strip().strip('"').strip("'")
-    if not secret_target:
-        return False
-
-    clean_input = entered_password.strip()
-    input_hash = hashlib.sha256(clean_input.encode("utf-8")).hexdigest()
-    target_hash = hashlib.sha256(secret_target.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(input_hash, target_hash)
-
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    .stApp {
-        background: radial-gradient(circle at 10% 10%, #161124 0%, #0b0914 45%, #07060c 100%);
-        color: #f8f9fa;
-    }
-    .hero-banner {
-        background: linear-gradient(135deg, rgba(255, 70, 85, 0.16) 0%, rgba(157, 78, 221, 0.18) 50%, rgba(255, 102, 170, 0.15) 100%);
-        border: 1px solid rgba(255, 102, 170, 0.35);
-        border-radius: 18px;
-        padding: 24px 30px;
-        margin-bottom: 24px;
-        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-    }
-    .hero-title {
-        font-size: 2.0rem;
-        font-weight: 800;
-        background: linear-gradient(90deg, #ff4655, #ff66aa, #c77dff);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0;
-    }
-    .glass-card {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
-        padding: 18px 20px;
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
-    }
-    .metric-label {
-        color: #9d94b5;
-        font-size: 0.78rem;
-        text-transform: uppercase;
-        letter-spacing: 1.1px;
-        font-weight: 600;
-    }
-    .metric-value {
-        font-size: 1.65rem;
-        font-weight: 800;
-        color: #ffffff;
-        margin: 4px 0;
-        font-family: 'JetBrains Mono', monospace;
-    }
-    .metric-badge {
-        display: inline-block;
-        padding: 3px 9px;
-        border-radius: 99px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        background: rgba(255, 102, 170, 0.15);
-        color: #ff85bb;
-    }
-    .tag-pill {
-        display: inline-block;
-        background: rgba(157, 78, 221, 0.18);
-        border: 1px solid rgba(157, 78, 221, 0.4);
-        color: #e0aaff;
-        padding: 4px 11px;
-        border-radius: 999px;
-        font-size: 0.78rem;
-        margin: 3px 4px 3px 0;
-        font-family: 'JetBrains Mono', monospace;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    _, center_col, _ = st.columns([1, 1.4, 1])
-    with center_col:
-        st.write("")
-        st.write("")
-        st.markdown("""
-        <div class="hero-banner" style="text-align:center;">
-            <p class="hero-title">🔒 LIL MIAN // SECURITY GATE</p>
-            <p style="color:#b8b2c8; margin-top:8px;">Encrypted Creator Command Center • Authorized Access Only (@awwmian)</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        with st.container(border=True):
-            pwd_input = st.text_input("🔑 Enter Master Passkey:", type="password", placeholder="••••••••••••••••••••••••")
-            unlock_btn = st.button("🔓 Unlock Command Center", type="primary", use_container_width=True)
-            
-            if unlock_btn or pwd_input:
-                if verify_passkey(pwd_input):
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("⛔ Invalid Master Passkey. Access Denied.")
-    st.stop()
+    return stats
 
 # ==========================================
-# CACHED NON-BLOCKING DATA FETCHERS
+# 3. FAST VALORANT & OSU! TREND MINER
 # ==========================================
-@st.cache_data(ttl=90, show_spinner=False)
-def cached_social_stats():
-    return engine.get_social_stats()
-
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_trends():
-    return engine.get_sns_trends_and_keywords()
-
-def get_db_table(query: str, params=()):
+def get_reddit_hot_topics(subreddit: str, limit: int = 2) -> list:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        conn = sqlite3.connect(engine.DB_PATH)
-        df = pd.read_sql_query(query, conn, params=params)
-        conn.close()
-        return df
+        url = f"https://www.reddit.com/r/{subreddit}/hot.rss"
+        resp = requests.get(url, headers=headers, timeout=2.5)
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.text)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            titles = []
+            for entry in root.findall("atom:entry", ns):
+                title = entry.find("atom:title", ns).text
+                if not any(pin in title.lower() for pin in ["megathread", "daily", "weekly", "faq"]):
+                    titles.append(title[:80])
+                if len(titles) >= limit:
+                    break
+            if titles:
+                return titles
     except Exception:
-        return pd.DataFrame()
+        pass
+    if subreddit.lower() == "valorant":
+        return ["Current Agent Meta & Duelist Entry Spacing", "Crosshair Placement & Micro-Adjustment Routine"]
+    return ["High-BPM Stream Stamina & Rapid Trigger Setup", "Top Player PP Farm Beatmap Pack"]
+
+def get_sns_trends_and_keywords() -> dict:
+    val_hot = get_reddit_hot_topics("VALORANT", 2)
+    osu_hot = get_reddit_hot_topics("osugame", 2)
+    google_trends = ["VALORANT VCT Meta", "osu! PP Record", "Hall Effect Rapid Trigger", "Aim Transfer Routine", "1v5 Radiant Clutch"]
+
+    return {
+        "YouTube Long-Form (@NotAwwMian)": {
+            "viral_topics": [
+                f"[VALORANT Hot] {val_hot[0]}",
+                f"[osu! Hot] {osu_hot[0]}",
+                "Ranked Climb Comms & Highlights / 'How osu! Changed My VALORANT Aim'"
+            ],
+            "keywords": ["valorant", "osugame", "valorant ranked", "osu highlights", "aim routine", "notawwmian", "valorant montage", "rapid trigger"]
+        },
+        "YouTube Shorts (@NotAwwMian)": {
+            "viral_topics": [
+                "1v5 Clutch w/ Raw Mic Reaction",
+                "osu! Handcam + Mechanical Keyboard ASMR on Fast Streams/Jumps",
+                "Guess the Rank (Viewer Clip Roast in 45 Seconds)"
+            ],
+            "keywords": ["#valorantclips", "#osugame", "#valorantshorts", "#aimbot", "#streamerclips", "#handcam", "#gaming"]
+        },
+        "Instagram Reels (@awwmianlive)": {
+            "viral_topics": [
+                "POV: Whiffing an easy shot vs hitting a 180 one-tap (J-Pop/Phonk Audio)",
+                "Desk Setup / IEM & Peripheral Check before Going Live on Twitch",
+                "osu! Speed Map Split-Screen (Screen + Handcam Overlay)"
+            ],
+            "keywords": ["valorantclips", "osugame", "gamerpov", "awwmianlive", "twitchstreamer", "setupinspiration", "valorantgameplay"]
+        },
+        "Twitch Streams (Twitch.tv/AwwMian)": {
+            "viral_topics": [
+                f"[Community Meta] {val_hot[1] if len(val_hot)>1 else 'Agent Tier List Debate'}",
+                f"[osu! Meta] {osu_hot[1] if len(osu_hot)>1 else 'Viewer Beatmap Requests (!bsr)'}",
+                "Viewer 1v1s / Sub Custom Lobbies / Agent Roulette Challenge"
+            ],
+            "keywords": ["!sens", "!skin", "!profile", "Viewer Maps", "Ranked Grind", "1v1 Viewers", "Chill Vibes"]
+        },
+        "Live Web & Gaming Surges": google_trends
+    }
 
 # ==========================================
-# MAIN AUTHENTICATED DASHBOARD
+# 4. AI CONTENT PREDICTOR (GEMINI SDK)
 # ==========================================
-sched = engine.get_next_stream_info()
-stats = cached_social_stats()
+def generate_ideas_and_predictions(custom_focus: str = "VALORANT & osu!") -> str:
+    trends = get_sns_trends_and_keywords()
+    val_context = trends["YouTube Long-Form (@NotAwwMian)"]["viral_topics"][:2]
+    prompt = f"""
+    You are the personal viral producer for 'AwwMian' (Twitch: Twitch.tv/AwwMian, YouTube: @NotAwwMian, Instagram: @awwmianlive).
+    Stream Schedule (Japan Time / GMT+9):
+    - Wednesday Night: 9:30 PM - 12:15 AM JST
+    - Friday Late Night: 12:15 AM - 2:45 AM JST
+    - Sunday Evening: 5:30 PM - 8:00 PM JST
+    Main Games: VALORANT and osu!
+    Today's Focus: {custom_focus}
+    Live VALORANT & osu! Hot Topics right now: {val_context}
+    
+    Generate an actionable, hype, pro-level content plan with:
+    1. 🔴 1 YouTube Video Blueprint for @NotAwwMian (Click-worthy Title, Thumbnail visual layout, and first 10-second hook).
+    2. ⚡ 2 Short-Form Ideas for @awwmianlive (IG Reels) & YT Shorts (specify exact audio vibe, visual hook, and caption).
+    3. 🟣 1 Interactive Twitch Stream Segment for Twitch.tv/AwwMian's next JST broadcast that gets chat spamming.
+    4. 🔮 14-DAY META PREDICTION: Predict the next viral crossover trend between rhythm games (osu!) and tactical shooters (VALORANT) and how to film it today.
+    """
+    api_key = clean_env("GEMINI_API_KEY")
+    if api_key and api_key != "your_gemini_key_here":
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            return f"⚠️ Gemini API Error: {e}"
+    return "⚠️ Please verify your GEMINI_API_KEY in `.env` or Streamlit Secrets!"
 
-st.markdown(f"""
-<div class="hero-banner">
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-        <div>
-            <p class="hero-title">🌸 AWWMIAN // COMMAND CENTER v5.0</p>
-            <p style="color:#b8b2c8; margin-top:6px;">VALORANT & osu! Content Intelligence • Discord Server Engine • Real-Time Telemetry (JST / GMT+9)</p>
-        </div>
-        <div style="text-align:right;">
-            <span class="metric-badge">⏰ NEXT STREAM (JST): {sched['countdown']}</span>
-            <div style="color:#e2d9f3; font-size:0.88rem; margin-top:6px;"><b>{sched['label']}</b><br>{sched['next_date']}</div>
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-df_xp = get_db_table("SELECT user_id, level, xp FROM user_xp ORDER BY level DESC, xp DESC")
-df_econ = get_db_table("SELECT user_id, balance, bank, padlocks FROM economy ORDER BY (balance + bank) DESC")
-total_miancoins = int((df_econ["balance"] + df_econ["bank"]).sum()) if not df_econ.empty else 0
-
-c1, c2, c3, c4, c5 = st.columns(5)
-cards = [
-    (c1, "🟣 TWITCH STATUS", stats["twitch_status"], f"Playing: {stats['twitch_game']}"),
-    (c2, "👥 TWITCH FOLLOWERS", f"{stats['twitch_followers']:,}", "twitch.tv/AwwMian"),
-    (c3, "🔴 YOUTUBE (@NotAwwMian)", f"{stats['yt_subscribers']:,} Subs", f"{stats['yt_total_views']:,} Views • {stats['yt_video_count']} Vids"),
-    (c4, "📸 INSTAGRAM & TWITTER", f"{stats['ig_handle']} • @{engine.TWITTER_USERNAME}", "Auto-Feeds Active"),
-    (c5, "🌸 SERVER ECONOMY", f"{total_miancoins:,} Coins", f"{len(df_xp)} Ranked Discord Members")
-]
-
-for col, label, val, sub in cards:
-    with col:
-        st.markdown(f"""
-        <div class="glass-card">
-            <div class="metric-label">{label}</div>
-            <div class="metric-value">{val}</div>
-            <span class="metric-badge">{sub}</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-st.write("")
-
-tab_trends, tab_ai, tab_discord, tab_vault = st.tabs([
-    "🔥 Viral Radar & SNS Keywords",
-    "🧠 Gemini AI Producer & Predictor",
-    "🏰 Lil Mian Discord Server Live DB",
-    "💾 Synced Idea Vault"
-])
-
-with tab_trends:
-    trends = cached_trends()
-    st.markdown("**🌐 Live Japan / Global Search Surges:** " + " ".join([f"`{x}`" for x in trends["Live Web & Gaming Surges"]]))
-    st.write("")
-    col_a, col_b = st.columns(2)
-    platforms = [
-        ("▶️ YouTube Long-Form (@NotAwwMian)", trends["YouTube Long-Form (@NotAwwMian)"], col_a),
-        ("⚡ YouTube Shorts (@NotAwwMian)", trends["YouTube Shorts (@NotAwwMian)"], col_a),
-        ("📸 Instagram Reels (@awwmianlive)", trends["Instagram Reels (@awwmianlive)"], col_b),
-        ("🟣 Twitch Broadcasts (Twitch.tv/AwwMian)", trends["Twitch Streams (Twitch.tv/AwwMian)"], col_b),
-    ]
-    for title, data, target_col in platforms:
-        with target_col:
-            with st.container(border=True):
-                st.subheader(title)
-                for topic in data["viral_topics"]:
-                    st.markdown(f"- {topic}")
-                pills_html = "".join([f'<span class="tag-pill">{k}</span>' for k in data["keywords"]])
-                st.markdown(f"<div style='margin-top:10px;'>{pills_html}</div>", unsafe_allow_html=True)
-
-with tab_ai:
-    st.subheader("🔮 AI Viral Scriptwriter & 14-Day Meta Predictor")
-    focus_col1, focus_col2 = st.columns([3, 1])
-    with focus_col1:
-        focus_input = st.text_input(
-            "What VALORANT Agent, Challenge, or osu! Beatmap are you filming today?",
-            value="VALORANT Ranked Clutches & osu! High-BPM Handcam"
-        )
-    with focus_col2:
-        st.write("")
-        st.write("")
-        gen_btn = st.button("✨ Generate Viral Blueprint", type="primary", use_container_width=True)
-
-    if gen_btn:
-        with st.spinner("Analyzing live VALORANT & osu! meta velocity..."):
-            report = engine.generate_ideas_and_predictions(focus_input)
-            with st.container(border=True):
-                st.markdown(report)
-
-with tab_discord:
-    d_col1, d_col2, d_col3 = st.columns(3)
-    with d_col1:
-        with st.container(border=True):
-            st.subheader("🏆 XP Leaderboard")
-            if df_xp.empty:
-                st.caption("No XP logged yet. Chat in Discord to populate!")
-            else:
-                st.dataframe(df_xp, use_container_width=True, hide_index=True)
-    with d_col2:
-        with st.container(border=True):
-            st.subheader("🌸 Richest MianCoin Holders")
-            if df_econ.empty:
-                st.caption("No MianCoins claimed yet. Chat or run `/daily` in Discord!")
-            else:
-                st.dataframe(df_econ, use_container_width=True, hide_index=True)
-    with d_col3:
-        with st.container(border=True):
-            st.subheader("🛡️ Moderation Warnings")
-            df_warn = get_db_table("SELECT id, user_id, reason, timestamp FROM warnings ORDER BY id DESC LIMIT 15")
-            if df_warn.empty:
-                st.success("✅ Zero active warnings in server!")
-            else:
-                st.dataframe(df_warn, use_container_width=True, hide_index=True)
-
-with tab_vault:
-    v_col1, v_col2 = st.columns([1, 2])
-    with v_col1:
-        with st.container(border=True):
-            st.subheader("➕ Add New Content Idea")
-            with st.form("dashboard_idea_form", clear_on_submit=True):
-                new_idea = st.text_area("Video title, hook, or stream segment idea:")
-                if st.form_submit_button("💾 Save to Vault", type="primary", use_container_width=True) and new_idea:
-                    engine.save_clip_idea(new_idea, source="Web Dashboard")
-                    st.rerun()
-    with v_col2:
-        st.subheader("📂 Saved Ideas (Synced with `/clip_idea`)")
-        saved_ideas = engine.get_saved_ideas(limit=20)
-        if not saved_ideas:
-            st.info("No ideas saved yet! Use `/clip_idea` on Discord or add one on the left.")
-        else:
-            for idea_id, ts, src, text in saved_ideas:
-                with st.container(border=True):
-                    ic1, ic2 = st.columns([6, 1])
-                    ic1.markdown(f"**{text}**")
-                    ic1.caption(f"🕒 {ts} • Source: `{src}`")
-                    if ic2.button("🗑️", key=f"del_{idea_id}"):
-                        engine.delete_idea(idea_id)
-                        st.rerun()
-
-with st.sidebar:
-    st.markdown("### 🌸 Lil Mian Control Deck")
-    st.caption("🇯🇵 All schedules locked to **Japan Time (JST / GMT+9)**")
-    st.markdown("""
-    - **Wed Night:** `9:30 PM – 12:15 AM JST`
-    - **Fri Late:** `12:15 AM – 2:45 AM JST`
-    - **Sun Eve:** `5:30 PM – 8:00 PM JST`
-    """)
-    st.divider()
-    if st.button("🔄 Refresh Live Telemetry", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-    if st.button("🔒 Lock Dashboard", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
+# ==========================================
+# 5. REMOTE WINDOWS PC STREAM PREP LAUNCHER
+# ==========================================
+def trigger_windows_stream_prep() -> list:
+    launched = []
+    try:
+        webbrowser.open("https://dashboard.twitch.tv/u/AwwMian/stream-manager")
+        launched.append("Twitch Stream Manager (AwwMian)")
+        webbrowser.open("https://studio.youtube.com")
+        launched.append("YouTube Studio (@NotAwwMian)")
+        obs_paths = [
+            r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
+            r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe"
+        ]
+        for path in obs_paths:
+            if os.path.exists(path):
+                subprocess.Popen([path], cwd=os.path.dirname(path))
+                launched.append("OBS Studio (64-bit)")
+                break
+    except Exception as e:
+        launched.append(f"Cloud Mode Note: {e}")
+    return launched
