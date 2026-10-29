@@ -6,7 +6,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import database as db
+import core_engine as db
 import core_engine as engine
 
 TWITCH_CLIENT_ID = engine.TWITCH_CLIENT_ID
@@ -16,11 +16,11 @@ YOUTUBE_API_KEY = engine.YOUTUBE_API_KEY
 YOUTUBE_CHANNEL_ID = engine.clean_env("YOUTUBE_CHANNEL_ID")
 TWITTER_USERNAME = engine.clean_env("TWITTER_USERNAME", "tei_0415").lstrip("@")
 
-NITTER_RSS_MIRRORS = [
-    "https://nitter.poast.org/{user}/rss",
-    "https://nitter.privacydev.net/{user}/rss",
+TWITTER_SOURCES = [
+    "https://syndication.twitter.com/srv/timeline-profile/screen-name/{user}",
+    "https://rsshub.app/twitter/user/{user}",
     "https://xcancel.com/{user}/rss",
-    "https://nitter.net/{user}/rss"
+    "https://nitter.poast.org/{user}/rss"
 ]
 
 class AlertsCog(commands.Cog):
@@ -36,6 +36,21 @@ class AlertsCog(commands.Cog):
         self.check_twitch_live.cancel()
         self.check_youtube_rss.cancel()
         self.check_twitter_feed.cancel()
+
+    async def ensure_twitter_channel(self, guild: discord.Guild, cfg: dict) -> discord.TextChannel:
+        """Finds or automatically creates #🐦・twitter-feed so tweets never fail to post!"""
+        ch = guild.get_channel(cfg.get("twitter_channel_id") or 0) if cfg else None
+        if not ch:
+            ch = discord.utils.find(lambda c: "twitter" in c.name.lower() or "tweets" in c.name.lower(), guild.text_channels)
+        if not ch:
+            cat = discord.utils.get(guild.categories, name="📡 AWWMIAN MEDIA HUB")
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(send_messages=False, read_messages=True),
+                guild.me: discord.PermissionOverwrite(send_messages=True, read_messages=True, embed_links=True)
+            }
+            ch = await guild.create_text_channel("🐦・twitter-feed", category=cat, overwrites=overwrites)
+            await db.save_guild_config(guild.id, twitter_channel_id=ch.id)
+        return ch
 
     async def get_twitch_token(self, session: aiohttp.ClientSession) -> str:
         if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
@@ -69,9 +84,6 @@ class AlertsCog(commands.Cog):
         except Exception:
             pass
 
-    # ==========================================
-    # 1. TWITCH HELIX LIVE MONITOR (EVERY 60s)
-    # ==========================================
     @tasks.loop(seconds=60)
     async def check_twitch_live(self):
         await self.bot.wait_until_ready()
@@ -142,9 +154,6 @@ class AlertsCog(commands.Cog):
                     await db.save_guild_config(guild.id, is_currently_live=0)
                     await self.toggle_streamer_live_role(guild, live_role_id, False)
 
-    # ==========================================
-    # 2. YOUTUBE RSS MONITOR (SHORTS VS LONG-FORM)
-    # ==========================================
     @tasks.loop(minutes=5)
     async def check_youtube_rss(self):
         await self.bot.wait_until_ready()
@@ -210,88 +219,65 @@ class AlertsCog(commands.Cog):
                 pass
 
     # ==========================================
-    # 3. AUTOMATIC TWITTER FEED MONITOR (EVERY 4 MINS)
+    # 3. MULTI-ENGINE TWITTER MONITOR (EVERY 3 MINS)
     # ==========================================
-    @tasks.loop(minutes=4)
+    async def fetch_latest_tweet_id(self, username: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for template in TWITTER_SOURCES:
+                url = template.format(user=username)
+                try:
+                    async with session.get(url, timeout=6) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            # Match status IDs from Syndication JSON or RSS XML
+                            ids = re.findall(r'status/(\d{15,22})', text)
+                            if not ids:
+                                ids = re.findall(r'"id_str"\s*:\s*"(\d{15,22})"', text)
+                            if ids:
+                                # Return the highest (newest) numeric tweet ID!
+                                return str(max(int(i) for i in ids))
+                except Exception:
+                    continue
+        return ""
+
+    @tasks.loop(minutes=3)
     async def check_twitter_feed(self):
         await self.bot.wait_until_ready()
         if not TWITTER_USERNAME:
             return
 
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LilMianTwitterBot/5.0"}
-        xml_data = None
-
-        async with aiohttp.ClientSession(headers=headers) as session:
-            for mirror in NITTER_RSS_MIRRORS:
-                url = mirror.format(user=TWITTER_USERNAME)
-                try:
-                    async with session.get(url, timeout=6) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            if "<item>" in text:
-                                xml_data = text
-                                break
-                except Exception:
-                    continue
-
-        if not xml_data:
+        tweet_id = await self.fetch_latest_tweet_id(TWITTER_USERNAME)
+        if not tweet_id:
             return
 
-        try:
-            root = ET.fromstring(xml_data)
-            channel = root.find("channel")
-            if channel is None:
-                return
-            items = channel.findall("item")
-            if not items:
-                return
+        if await db.is_tweet_posted(tweet_id):
+            return
+        await db.mark_tweet_posted(tweet_id, str(int(time.time())))
 
-            latest = items[0]
-            link = latest.find("link").text if latest.find("link") is not None else ""
-            pub_date = latest.find("pubDate").text if latest.find("pubDate") is not None else ""
+        fx_url = f"https://fxtwitter.com/{TWITTER_USERNAME}/status/{tweet_id}"
 
-            # Extract numeric Tweet ID from URL
-            match = re.search(r"/status/(\d+)", link)
-            if not match:
-                return
-            tweet_id = match.group(1)
+        for guild in self.bot.guilds:
+            cfg = await db.get_guild_config(guild.id) or {}
+            ch = await self.ensure_twitter_channel(guild, cfg)
+            role = guild.get_role(cfg.get("twitter_ping_role_id") or 0) or discord.utils.get(guild.roles, name="🐦 Twitter Ping")
+            if ch:
+                ping_str = f"{role.mention} " if role else ""
+                await ch.send(f"🐦 {ping_str}**@{TWITTER_USERNAME} just posted a new Tweet!**\n{fx_url}")
 
-            if await db.is_tweet_posted(tweet_id):
-                return
-            await db.mark_tweet_posted(tweet_id, pub_date)
-
-            # Use fxtwitter.com so Discord natively embeds full Twitter videos, multiple photos & text!
-            fx_url = f"https://fxtwitter.com/{TWITTER_USERNAME}/status/{tweet_id}"
-
-            for guild in self.bot.guilds:
-                cfg = await db.get_guild_config(guild.id)
-                if not cfg:
-                    continue
-                ch = guild.get_channel(cfg.get("twitter_channel_id") or 0)
-                if not ch:
-                    ch = discord.utils.find(lambda c: "twitter" in c.name.lower() or "tweets" in c.name.lower(), guild.text_channels)
-                role = guild.get_role(cfg.get("twitter_ping_role_id") or 0)
-
-                if ch:
-                    ping_str = f"{role.mention} " if role else ""
-                    await ch.send(f"🐦 {ping_str}**@{TWITTER_USERNAME} just posted a new Tweet!**\n{fx_url}")
-        except Exception:
-            pass
-
-    @app_commands.command(name="post_tweet", description="[ADMIN/AWWMIAN ONLY] Instantly beam a Tweet link into #twitter-feed with rich media!")
+    @app_commands.command(name="post_tweet", description="[ADMIN/AWWMIAN ONLY] Instantly beam a Tweet link into #twitter-feed with rich video/image embed!")
     @app_commands.default_permissions(administrator=True)
     async def post_tweet_cmd(self, interaction: discord.Interaction, tweet_url: str):
         await interaction.response.defer(ephemeral=True)
-        # Convert x.com or twitter.com into fxtwitter.com for rich Discord video/image cards
         clean_url = re.sub(r"https?://(www\.)?(twitter\.com|x\.com)", "https://fxtwitter.com", tweet_url.strip())
-        cfg = await db.get_guild_config(interaction.guild.id)
-        ch = interaction.guild.get_channel(cfg.get("twitter_channel_id") or 0) if cfg else None
-        if not ch:
-            ch = discord.utils.find(lambda c: "twitter" in c.name.lower(), interaction.guild.text_channels) or interaction.channel
-        role = interaction.guild.get_role(cfg.get("twitter_ping_role_id") or 0) if cfg else None
+        cfg = await db.get_guild_config(interaction.guild.id) or {}
+        ch = await self.ensure_twitter_channel(interaction.guild, cfg)
+        role = interaction.guild.get_role(cfg.get("twitter_ping_role_id") or 0) or discord.utils.get(interaction.guild.roles, name="🐦 Twitter Ping")
         ping_str = f"{role.mention} " if role else ""
 
-        await ch.send(f"🐦 {ping_str}**New Tweet from AwwMian!**\n{clean_url}")
+        await ch.send(f"🐦 {ping_str}**New Tweet from @{TWITTER_USERNAME}!**\n{clean_url}")
         await interaction.followup.send(f"✅ Tweet beamed to {ch.mention}!", ephemeral=True)
 
 async def setup(bot: commands.Bot):

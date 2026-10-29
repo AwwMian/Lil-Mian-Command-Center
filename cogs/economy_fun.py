@@ -4,22 +4,16 @@ import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
-import database as db
+import core_engine as db
 
-# ==========================================
-# EXPANDED SHOP: BOOSTERS, ITEMS & PRESTIGE ROLES
-# ==========================================
 SHOP_ITEMS = {
-    # XP Boosters
     "boost_1h": ("⚡ 2x XP & Coin Booster (1 Hour)", 250, "booster_1h", "Doubles all chat XP & MianCoins for 1 Hour!"),
     "boost_5h": ("🔥 2x XP & Coin Booster (5 Hours)", 900, "booster_5h", "Doubles all chat XP & MianCoins for 5 Hours!"),
     "boost_24h": ("🌟 2x XP & Coin Booster (24 Hours)", 2200, "booster_24h", "Doubles all chat XP & MianCoins for a full Day!"),
-    # Utility & Defense Items
     "padlock": ("🔒 Heavy Padlock (Anti-Rob Shield)", 400, "item_padlock", "Protects your wallet from 1 /rob attempt & fines the thief!"),
     "bank_note": ("🏦 Bank Expansion Note (+2,500 Cap)", 600, "item_bank", "Permanently increases your safe Bank storage by +2,500 Coins!"),
-    "lootbox": ("🎲 Mystery Lootbox", 500, "item_lootbox", "Open for a chance at 100 to 2,000 MianCoins or a free Padlock!"),
+    "lootbox": ("🎲 Mystery Lootbox", 500, "item_lootbox", "Open for a chance at 100 to 2,000 MianCoins!"),
     "nick_pass": ("🏷️ Custom Nickname Pass", 1500, "item_nick", "Unlocks permission to change your server nickname!"),
-    # High-Prestige Roles (Hardcore Grind!)
     "vip": ("🌸 Mian VIP", 15000, discord.Color.from_rgb(255, 105, 180), "Prestige Role: Exclusive Pink VIP status in the server!"),
     "rich": ("💸 Rich Aim God", 40000, discord.Color.from_rgb(255, 215, 0), "Prestige Role: Flex serious wealth on the server!"),
     "king": ("👑 Economy Legend", 100000, discord.Color.from_rgb(138, 43, 226), "Mythic Role: Only the top 1% grinders will ever own this!")
@@ -97,9 +91,6 @@ class EconomyFunCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ==========================================
-    # 1. ANIME EMOTES & GAMING MEMES
-    # ==========================================
     @app_commands.command(name="emote", description="Send an animated Anime GIF reaction to a member")
     @app_commands.describe(emotion="Pick an anime emotion/action", target="Who are you doing this to?")
     @app_commands.choices(emotion=[
@@ -114,7 +105,7 @@ class EconomyFunCog(commands.Cog):
         gif_url = "https://media1.tenor.com/m/wU6C2-kK2vUAAAAd/marin-kitagawa-anime-wave.gif"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://nekos.best/api/v2/{endpoint}") as resp:
+                async with session.get(f"https://nekos.best/api/v2/{endpoint}", timeout=4) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         gif_url = data["results"][0]["url"]
@@ -139,7 +130,7 @@ class EconomyFunCog(commands.Cog):
         async with aiohttp.ClientSession() as session:
             url = f"https://meme-api.com/gimme/{chosen_sub}"
             try:
-                async with session.get(url, timeout=5) as resp:
+                async with session.get(url, timeout=4) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if not data.get("nsfw", False):
@@ -156,11 +147,9 @@ class EconomyFunCog(commands.Cog):
                 pass
         await interaction.followup.send("⚡ Meme radar is refreshing—run `/memes` again in a second!")
 
-    # ==========================================
-    # 2. WALLET, BANK, INVENTORY & TIMED REWARDS
-    # ==========================================
     @app_commands.command(name="balance", description="Check your 🌸 MianCoins Wallet, safe Bank balance & active Boosters")
     async def balance_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
+        await interaction.response.defer()
         target = member or interaction.user
         data = await db.ensure_economy_user(interaction.guild.id, target.id)
         mult, rem_sec = await db.get_active_xp_multiplier(interaction.guild.id, target.id)
@@ -177,19 +166,20 @@ class EconomyFunCog(commands.Cog):
         embed.add_field(name="🔒 Active Padlocks", value=f"`{data.get('padlocks', 0)}` Shield(s)", inline=True)
         embed.add_field(name="🚀 XP & Coin Booster", value=boost_txt, inline=True)
         embed.set_footer(text="Tip: Chat actively to earn Coins & XP! Use /deposit to protect coins from /rob.")
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="deposit", description="Deposit wallet MianCoins into your safe Bank so nobody can /rob you")
     @app_commands.describe(amount="Amount to deposit (or type 0 to deposit Max)")
     async def deposit_cmd(self, interaction: discord.Interaction, amount: int = 0):
+        await interaction.response.defer()
         data = await db.ensure_economy_user(interaction.guild.id, interaction.user.id)
         space = max(0, data["bank_max"] - data["bank"])
         if space <= 0:
-            await interaction.response.send_message("🏦 Your Bank is full! Buy a **Bank Expansion Note** in `/shop` to hold more.", ephemeral=True)
+            await interaction.followup.send("🏦 Your Bank is full! Buy a **Bank Expansion Note** in `/shop` to hold more.")
             return
         to_dep = min(data["balance"], space) if amount <= 0 else min(amount, data["balance"], space)
         if to_dep <= 0:
-            await interaction.response.send_message("❌ You don't have enough wallet coins to deposit!", ephemeral=True)
+            await interaction.followup.send("❌ You don't have enough wallet coins to deposit!")
             return
 
         async with aiosqlite.connect(db.DB_PATH) as conn:
@@ -198,14 +188,15 @@ class EconomyFunCog(commands.Cog):
                 (to_dep, to_dep, interaction.guild.id, interaction.user.id)
             )
             await conn.commit()
-        await interaction.response.send_message(f"🏦 Deposited **`{to_dep:,}` 🌸 MianCoins** into your safe Bank!")
+        await interaction.followup.send(f"🏦 Deposited **`{to_dep:,}` 🌸 MianCoins** into your safe Bank!")
 
     @app_commands.command(name="withdraw", description="Withdraw MianCoins from your Bank back into your Wallet")
     async def withdraw_cmd(self, interaction: discord.Interaction, amount: int):
+        await interaction.response.defer()
         data = await db.ensure_economy_user(interaction.guild.id, interaction.user.id)
         to_with = min(max(0, amount), data["bank"])
         if to_with <= 0:
-            await interaction.response.send_message("❌ You don't have that many coins in your Bank!", ephemeral=True)
+            await interaction.followup.send("❌ You don't have that many coins in your Bank!")
             return
         async with aiosqlite.connect(db.DB_PATH) as conn:
             await conn.execute(
@@ -213,61 +204,62 @@ class EconomyFunCog(commands.Cog):
                 (to_with, to_with, interaction.guild.id, interaction.user.id)
             )
             await conn.commit()
-        await interaction.response.send_message(f"👛 Withdrew **`{to_with:,}` 🌸 MianCoins** to your Wallet!")
+        await interaction.followup.send(f"👛 Withdrew **`{to_with:,}` 🌸 MianCoins** to your Wallet!")
 
     @app_commands.command(name="daily", description="Claim your daily +50 🌸 MianCoins supply drop (24h cooldown)")
     async def daily_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         ok, val, reward = await db.claim_timed_reward(interaction.guild.id, interaction.user.id, "last_daily", 50, 86400)
         if not ok:
-            await interaction.response.send_message(
-                f"⏳ **Daily Cooldown!** Come back in **`{format_cooldown(val)}`** (Meanwhile, chat in the server to earn coins!).",
-                ephemeral=True
+            await interaction.followup.send(
+                f"⏳ **Daily Cooldown!** Come back in **`{format_cooldown(val)}`** (Meanwhile, chat in the server to earn coins!)."
             )
             return
-        await interaction.response.send_message(f"🎁 **Daily Supply Drop!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
+        await interaction.followup.send(f"🎁 **Daily Supply Drop!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
 
     @app_commands.command(name="weekly", description="Claim your weekly +200 🌸 MianCoins bonus (Requires Level 2+ • 7d cooldown)")
     async def weekly_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         lvl = await db.get_user_level(interaction.guild.id, interaction.user.id)
         if lvl < 2:
-            await interaction.response.send_message("🔒 **Level Locked!** You must reach **Level 2** by chatting in the server before claiming `/weekly`!", ephemeral=True)
+            await interaction.followup.send("🔒 **Level Locked!** You must reach **Level 2** by chatting in the server before claiming `/weekly`!")
             return
         ok, val, reward = await db.claim_timed_reward(interaction.guild.id, interaction.user.id, "last_weekly", 200, 604800)
         if not ok:
-            await interaction.response.send_message(f"⏳ **Weekly Cooldown!** Come back in **`{format_cooldown(val)}`**!", ephemeral=True)
+            await interaction.followup.send(f"⏳ **Weekly Cooldown!** Come back in **`{format_cooldown(val)}`**!")
             return
-        await interaction.response.send_message(f"💎 **Weekly Bonus Claimed!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
+        await interaction.followup.send(f"💎 **Weekly Bonus Claimed!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
 
     @app_commands.command(name="monthly", description="Claim your monthly +750 🌸 MianCoins crate (Requires Level 5+ • 30d cooldown)")
     async def monthly_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         lvl = await db.get_user_level(interaction.guild.id, interaction.user.id)
         if lvl < 5:
-            await interaction.response.send_message("🔒 **Level Locked!** You must reach **Level 5** by chatting in the server before claiming `/monthly`!", ephemeral=True)
+            await interaction.followup.send("🔒 **Level Locked!** You must reach **Level 5** by chatting in the server before claiming `/monthly`!")
             return
         ok, val, reward = await db.claim_timed_reward(interaction.guild.id, interaction.user.id, "last_monthly", 750, 2592000)
         if not ok:
-            await interaction.response.send_message(f"⏳ **Monthly Cooldown!** Come back in **`{format_cooldown(val)}`**!", ephemeral=True)
+            await interaction.followup.send(f"⏳ **Monthly Cooldown!** Come back in **`{format_cooldown(val)}`**!")
             return
-        await interaction.response.send_message(f"👑 **Monthly Crate Claimed!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
+        await interaction.followup.send(f"👑 **Monthly Crate Claimed!** You received **+{reward:,} 🌸 MianCoins**! (Wallet: `{val:,}`)")
 
-    # ==========================================
-    # 3. GRIND & PVP COMMANDS (/beg, /hunt, /crime, /rob)
-    # ==========================================
     @app_commands.command(name="beg", description="Ask pros for spare change (45s cooldown)")
     @app_commands.checks.cooldown(1, 45.0, key=lambda i: (i.guild_id, i.user.id))
     async def beg_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         donors = ["TenZ", "mrekk", "Cookiezi", "Boaster", "AwwMian", "Kyedae", "Faker"]
         donor = random.choice(donors)
         if random.random() < 0.70:
             reward = random.randint(5, 25)
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, reward)
-            await interaction.response.send_message(f"🥺 **{donor}** tossed you **+{reward} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
+            await interaction.followup.send(f"🥺 **{donor}** tossed you **+{reward} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
         else:
-            await interaction.response.send_message(f"💀 **{donor}** told you to go grind DM and walked away. (`+0 coins`)")
+            await interaction.followup.send(f"💀 **{donor}** told you to go grind DM and walked away. (`+0 coins`)")
 
     @app_commands.command(name="hunt", description="Hunt for creatures & gun buddies (60s cooldown)")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: (i.guild_id, i.user.id))
     async def hunt_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         loot = [
             ("🐛 Common Slime", 10),
             ("🦊 Kitsune Spirit", 25),
@@ -277,47 +269,48 @@ class EconomyFunCog(commands.Cog):
         ]
         found_name, coins = random.choices(loot, weights=[50, 25, 14, 8, 3], k=1)[0]
         new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, coins)
-        await interaction.response.send_message(f"🏹 **Hunt Complete!** You caught a **{found_name}** worth **+{coins} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
+        await interaction.followup.send(f"🏹 **Hunt Complete!** You caught a **{found_name}** worth **+{coins} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
 
     @app_commands.command(name="crime", description="High-risk heist! Win 40-100 coins or pay a fine (90s cooldown)")
     @app_commands.checks.cooldown(1, 90.0, key=lambda i: (i.guild_id, i.user.id))
     async def crime_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         crimes = ["hacked Riot Vanguard servers", "borrowed Peppy's private jet", "smuggled Radiant gun buddies", "rigged a VCT bracket"]
         act = random.choice(crimes)
         if random.random() < 0.48:
             win = random.randint(40, 100)
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, win)
-            await interaction.response.send_message(f"🕵️ **HEIST SUCCESS!** You {act} and escaped with **+{win} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
+            await interaction.followup.send(f"🕵️ **HEIST SUCCESS!** You {act} and escaped with **+{win} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
         else:
             loss = random.randint(30, 75)
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, -loss)
-            await interaction.response.send_message(f"🚓 **BUSTED!** Security caught you trying to {act}! You paid a **-{loss} 🌸 MianCoins** fine. (Wallet: `{new_bal:,}`)")
+            await interaction.followup.send(f"🚓 **BUSTED!** Security caught you trying to {act}! You paid a **-{loss} 🌸 MianCoins** fine. (Wallet: `{new_bal:,}`)")
 
     @app_commands.command(name="rob", description="Attempt to steal MianCoins from another member's unprotected Wallet! (2m cooldown)")
     @app_commands.checks.cooldown(1, 120.0, key=lambda i: (i.guild_id, i.user.id))
     async def rob_cmd(self, interaction: discord.Interaction, victim: discord.Member):
+        await interaction.response.defer()
         if victim.bot or victim.id == interaction.user.id:
-            await interaction.response.send_message("❌ You can't rob bots or yourself!", ephemeral=True)
+            await interaction.followup.send("❌ You can't rob bots or yourself!")
             return
 
         robber_data = await db.ensure_economy_user(interaction.guild.id, interaction.user.id)
         victim_data = await db.ensure_economy_user(interaction.guild.id, victim.id)
 
         if robber_data["balance"] < 50:
-            await interaction.response.send_message("❌ You need at least **`50 🌸 MianCoins`** in your wallet to attempt a robbery!", ephemeral=True)
+            await interaction.followup.send("❌ You need at least **`50 🌸 MianCoins`** in your wallet to attempt a robbery!")
             return
         if victim_data["balance"] < 50:
-            await interaction.response.send_message(f"💀 {victim.display_name} has less than 50 coins in their wallet—not worth robbing!", ephemeral=True)
+            await interaction.followup.send(f"💀 {victim.display_name} has less than 50 coins in their wallet—not worth robbing!")
             return
 
-        # Check if Victim has an active Padlock from /shop!
         if victim_data.get("padlocks", 0) > 0:
             async with aiosqlite.connect(db.DB_PATH) as conn:
                 await conn.execute("UPDATE economy SET padlocks = padlocks - 1 WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, victim.id))
                 await conn.commit()
             await db.update_balance(interaction.guild.id, interaction.user.id, -50)
             await db.update_balance(interaction.guild.id, victim.id, 50)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🔒 **PADLOCK SHATTERED!** {interaction.user.mention} tried to rob {victim.mention}, "
                 f"but hit a **Heavy Padlock** and paid a **`50 🌸` fine** directly to {victim.mention}!"
             )
@@ -327,7 +320,7 @@ class EconomyFunCog(commands.Cog):
             stolen = random.randint(15, max(20, int(victim_data["balance"] * 0.30)))
             await db.update_balance(interaction.guild.id, victim.id, -stolen)
             await db.update_balance(interaction.guild.id, interaction.user.id, stolen)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🥷 **ROBBERY SUCCESS!** {interaction.user.mention} pickpocketed **`{stolen:,}` 🌸 MianCoins** from {victim.mention}'s wallet! "
                 f"*(Use `/deposit` or buy a `🔒 Padlock` in `/shop` to protect your coins!)*"
             )
@@ -335,21 +328,10 @@ class EconomyFunCog(commands.Cog):
             fine = 45
             await db.update_balance(interaction.guild.id, interaction.user.id, -fine)
             await db.update_balance(interaction.guild.id, victim.id, fine)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🚨 **CAUGHT RED-HANDED!** {interaction.user.mention} failed to rob {victim.mention} and paid them **`{fine}` 🌸 MianCoins** in damages!"
             )
 
-    @beg_cmd.error
-    @hunt_cmd.error
-    @crime_cmd.error
-    @rob_cmd.error
-    async def action_cooldown_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(f"⏳ Cooldown active! Wait **`{int(error.retry_after)}s`** before using this again.", ephemeral=True)
-
-    # ==========================================
-    # 4. EXPANDED SERVER SHOP (/shop & /buy)
-    # ==========================================
     @app_commands.command(name="shop", description="Browse XP Boosters, Padlocks, Bank Notes & Prestige Roles")
     async def shop_cmd(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -399,12 +381,11 @@ class EconomyFunCog(commands.Cog):
         bal = await db.get_balance(interaction.guild.id, interaction.user.id)
 
         if bal < price:
-            await interaction.followup.send(f"❌ You need **`{price:,}` 🌸 MianCoins** in your wallet to buy **{name}**, but you only have **`{bal:,}`**! *(Withdraw from `/bank` or chat more to earn!)*")
+            await interaction.followup.send(f"❌ You need **`{price:,}` 🌸 MianCoins** in your wallet to buy **{name}**, but you only have **`{bal:,}`**!")
             return
 
         await db.update_balance(interaction.guild.id, interaction.user.id, -price)
 
-        # Handle XP Boosters
         if meta == "booster_1h":
             rem = await db.activate_xp_booster(interaction.guild.id, interaction.user.id, 2.0, 3600)
             await interaction.followup.send(f"⚡ **2x BOOSTER ACTIVATED!** You now earn **Double XP & Chat Coins**! (Total active time: `{format_cooldown(rem)}`)")
@@ -418,7 +399,6 @@ class EconomyFunCog(commands.Cog):
             await interaction.followup.send(f"🌟 **24-HOUR 2x BOOSTER ACTIVATED!** You now earn **Double XP & Chat Coins** for a full day! (Total active time: `{format_cooldown(rem)}`)")
             return
 
-        # Handle Utility Items
         if meta == "item_padlock":
             async with aiosqlite.connect(db.DB_PATH) as conn:
                 await conn.execute("UPDATE economy SET padlocks = padlocks + 1 WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, interaction.user.id))
@@ -440,28 +420,25 @@ class EconomyFunCog(commands.Cog):
             return
 
         if meta == "item_nick":
-            await interaction.followup.send("🏷️ **Nickname Pass Unlocked!** Ping staff or use `/nick` to set your custom title!")
+            await interaction.followup.send("🏷️ **Nickname Pass Unlocked!** Ping staff to set your custom title!")
             return
 
-        # Handle Prestige Roles
         role = discord.utils.get(interaction.guild.roles, name=name)
         if not role:
             role = await interaction.guild.create_role(name=name, color=meta, hoist=True, reason="Lil Mian Prestige Shop Role")
         await interaction.user.add_roles(role)
         await interaction.followup.send(f"👑 **PRESTIGE UNLOCKED!** Congratulations {interaction.user.mention}, you claimed the **{role.mention}** role!")
 
-    # ==========================================
-    # 5. MINIGAMES (/slots, /coinflip, /trivia)
-    # ==========================================
     @app_commands.command(name="slots", description="Spin the MianCoin Slot Machine (Max Bet: 500)")
     @app_commands.describe(bet="Amount of MianCoins to bet (1 - 500)")
     async def slots_cmd(self, interaction: discord.Interaction, bet: int):
+        await interaction.response.defer()
         if bet <= 0 or bet > 500:
-            await interaction.response.send_message("⚠️ Bet must be between **1 and 500 🌸 MianCoins**!", ephemeral=True)
+            await interaction.followup.send("⚠️ Bet must be between **1 and 500 🌸 MianCoins**!")
             return
         bal = await db.get_balance(interaction.guild.id, interaction.user.id)
         if bal < bet:
-            await interaction.response.send_message(f"❌ You don't have enough wallet coins! (Wallet: `{bal:,}`)", ephemeral=True)
+            await interaction.followup.send(f"❌ You don't have enough wallet coins! (Wallet: `{bal:,}`)")
             return
 
         emojis = ["🌸", "🎯", "⭕", "💎", "🍒", "7️⃣"]
@@ -479,7 +456,7 @@ class EconomyFunCog(commands.Cog):
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, -bet)
             result = f"💀 **No match!** You lost **-{bet:,} 🌸 MianCoins**."
 
-        await interaction.response.send_message(f"### 🎰 `[ {r1} | {r2} | {r3} ]`\n{result}\n👛 **Wallet:** `{new_bal:,} 🌸`")
+        await interaction.followup.send(f"### 🎰 `[ {r1} | {r2} | {r3} ]`\n{result}\n👛 **Wallet:** `{new_bal:,} 🌸`")
 
     @app_commands.command(name="coinflip", description="Bet MianCoins on Heads or Tails (Max Bet: 500)")
     @app_commands.choices(call=[
@@ -487,21 +464,22 @@ class EconomyFunCog(commands.Cog):
         app_commands.Choice(name="Tails", value="Tails")
     ])
     async def coinflip_cmd(self, interaction: discord.Interaction, call: str, bet: int):
+        await interaction.response.defer()
         if bet <= 0 or bet > 500:
-            await interaction.response.send_message("⚠️ Bet must be between **1 and 500 🌸 MianCoins**!", ephemeral=True)
+            await interaction.followup.send("⚠️ Bet must be between **1 and 500 🌸 MianCoins**!")
             return
         bal = await db.get_balance(interaction.guild.id, interaction.user.id)
         if bal < bet:
-            await interaction.response.send_message(f"❌ Not enough wallet coins! (Wallet: `{bal:,}`)", ephemeral=True)
+            await interaction.followup.send(f"❌ Not enough wallet coins! (Wallet: `{bal:,}`)")
             return
 
         flip = random.choice(["Heads", "Tails"])
         if flip == call:
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, bet)
-            await interaction.response.send_message(f"🪙 The coin landed on **{flip}**! You won **+{bet:,} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
+            await interaction.followup.send(f"🪙 The coin landed on **{flip}**! You won **+{bet:,} 🌸 MianCoins**! (Wallet: `{new_bal:,}`)")
         else:
             new_bal = await db.update_balance(interaction.guild.id, interaction.user.id, -bet)
-            await interaction.response.send_message(f"🪙 The coin landed on **{flip}**... You lost **-{bet:,} 🌸 MianCoins**. (Wallet: `{new_bal:,}`)")
+            await interaction.followup.send(f"🪙 The coin landed on **{flip}**... You lost **-{bet:,} 🌸 MianCoins**. (Wallet: `{new_bal:,}`)")
 
     @app_commands.command(name="trivia", description="Answer a VALORANT or osu! trivia question for +35 MianCoins")
     @app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id))
