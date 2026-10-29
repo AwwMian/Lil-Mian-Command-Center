@@ -1,8 +1,10 @@
+import os
+import sqlite3
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
 import core_engine as engine
-import database as db
 from cogs.roles import (
     deploy_all_role_panels,
     COLOR_ROLES,
@@ -12,15 +14,28 @@ from cogs.roles import (
 from cogs.security import VerificationView
 
 AWWMIAN_USER_ID = 1156965426044080188
+DB_PATH = getattr(engine, "DB_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "awwmian_vault.db"))
+
+async def save_guild_config(guild_id: int, **kwargs) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM guild_config WHERE guild_id = ?", (guild_id,)) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            await db.execute("INSERT INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+        for col, val in kwargs.items():
+            try:
+                await db.execute(f"UPDATE guild_config SET {col} = ? WHERE guild_id = ?", (val, guild_id))
+            except Exception:
+                pass
+        await db.commit()
+
+# Expose helper to engine
+engine.save_guild_config = save_guild_config
 
 def is_awwmian_or_admin():
-    """Strictly restricts command execution to @awwmian (1156965426044080188) or Admin role holders."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        # 1. Exact Discord ID Match for @awwmian
         if interaction.user.id == AWWMIAN_USER_ID:
             return True
-
-        # 2. Check Server Owner, Administrator Permission, or 'Admin' Role
         if interaction.guild and isinstance(interaction.user, discord.Member):
             if interaction.user.id == interaction.guild.owner_id:
                 return True
@@ -28,7 +43,6 @@ def is_awwmian_or_admin():
                 return True
             if any(r.name.lower() in ("admin", "administrator") for r in interaction.user.roles):
                 return True
-
         await interaction.response.send_message(
             "⛔ **Access Denied:** This command is strictly locked to **@awwmian** (`1156965426044080188`) and Server **Admins**.",
             ephemeral=True
@@ -36,25 +50,23 @@ def is_awwmian_or_admin():
         return False
     return app_commands.check(predicate)
 
-
 class CreatorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ==========================================
-    # LOCKED ADMIN & AWWMIAN COMMANDS
-    # ==========================================
     @app_commands.command(name="reset_economy", description="[ADMIN/AWWMIAN ONLY] Wipe inflated MianCoin balances back to 25 starting coins!")
     @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     @is_awwmian_or_admin()
     async def reset_economy_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        await db.reset_guild_economy(interaction.guild.id)
-        await interaction.followup.send(
-            "♻️ **Economy Reset Complete!** All member wallets have been reset to **`25 🌸 MianCoins`** and cooldowns cleared for the new nerfed economy!",
-            ephemeral=True
-        )
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE economy SET balance = 25, bank = 0, bank_max = 1000, padlocks = 0, last_daily = 0, last_weekly = 0, last_monthly = 0 WHERE guild_id = ?",
+                (interaction.guild.id,)
+            )
+            await db.commit()
+        await interaction.followup.send("♻️ **Economy Reset Complete!** All member wallets have been reset to **`25 🌸 MianCoins`**.", ephemeral=True)
 
     @app_commands.command(name="server_setup", description="[ADMIN/AWWMIAN ONLY] Auto-build Twitter Feed, Verification Gate, Rules, Memes, Clips & Self-Roles!")
     @app_commands.default_permissions(administrator=True)
@@ -72,7 +84,6 @@ class CreatorCog(commands.Cog):
                 role = await guild.create_role(name=name, color=color, hoist=hoist, reason="Lil Mian /server_setup")
             return role
 
-        # 1. Core Roles (Including @✅ Verified & @🐦 Twitter Ping)
         verified_role = await get_or_create_role("✅ Verified", discord.Color.from_rgb(46, 204, 113), hoist=False)
         live_role = await get_or_create_role("🟣 LIVE NOW", discord.Color.purple(), hoist=True)
         stream_ping = await get_or_create_role("🔴 Stream Ping", discord.Color.from_rgb(230, 57, 70))
@@ -85,13 +96,11 @@ class CreatorCog(commands.Cog):
         lvl25_role = await get_or_create_role("💎 Level 25 (Veteran)", discord.Color.gold(), hoist=True)
         lvl50_role = await get_or_create_role("👑 Level 50 (AwwMian Legend)", discord.Color.magenta(), hoist=True)
 
-        # Pre-create Color, Pronoun, Age & Game Roles
         for c_name, _, c_color in COLOR_ROLES:
             await get_or_create_role(c_name, c_color)
         for i_name, i_color in IDENTITY_ROLES + GAME_ROLES:
             await get_or_create_role(i_name, i_color)
 
-        # Grant @✅ Verified to all current human members so existing members aren't locked out!
         for member in guild.members:
             if not member.bot and verified_role not in member.roles:
                 try:
@@ -99,20 +108,16 @@ class CreatorCog(commands.Cog):
                 except Exception:
                     pass
 
-        # 2. Permission Overwrites (Verification Gate Layer)
-        # Unverified (@everyone) can see #rules, #verify, #joins
         verify_gate_overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             verified_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, embed_links=True)
         }
-        # Read-only for Verified members (Announcements, Self-Roles, Alerts, Twitter Feed)
         verified_readonly_overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             verified_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, embed_links=True)
         }
-        # Interactive Community Channels for Verified members (#memes, #clips, #lil-mian-feedback)
         verified_chat_overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             verified_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
@@ -150,7 +155,6 @@ class CreatorCog(commands.Cog):
                     await ch.edit(overwrites=overwrites)
             return ch, created
 
-        # Welcome & Verification Channels
         ch_verify, _ = await get_or_create_channel("✅・verify", cat_welcome, verify_gate_overwrites)
         ch_rules, rules_new = await get_or_create_channel("📜・rules", cat_welcome, verify_gate_overwrites)
         ch_ann, _ = await get_or_create_channel("📢・announcements", cat_welcome, verified_readonly_overwrites)
@@ -158,21 +162,17 @@ class CreatorCog(commands.Cog):
         ch_joins, _ = await get_or_create_channel("👋・joins", cat_welcome, verify_gate_overwrites)
         ch_leaves, _ = await get_or_create_channel("💔・leaves", cat_welcome, verified_readonly_overwrites)
 
-        # Media Hub Channels (Includes #🐦・twitter-feed)
         ch_twitch, _ = await get_or_create_channel("🔔・live-alerts", cat_hub, verified_readonly_overwrites)
         ch_yt, _ = await get_or_create_channel("📺・youtube-uploads", cat_hub, verified_readonly_overwrites)
         ch_shorts, _ = await get_or_create_channel("📱・shorts-and-reels", cat_hub, verified_readonly_overwrites)
         ch_twitter, _ = await get_or_create_channel("🐦・twitter-feed", cat_hub, verified_readonly_overwrites)
 
-        # Community & Fun Channels (#memes, #clips, #lil-mian-feedback)
         ch_memes, _ = await get_or_create_channel("😂・memes", cat_comm, verified_chat_overwrites)
         ch_clips, _ = await get_or_create_channel("🎬・clips", cat_comm, verified_chat_overwrites)
         ch_feedback, _ = await get_or_create_channel("💡・lil-mian-feedback", cat_comm, verified_chat_overwrites)
-
-        # Staff Security Channel
         ch_modlogs, _ = await get_or_create_channel("🛡️・mod-logs", cat_sec)
 
-        await db.save_guild_config(
+        await save_guild_config(
             guild.id,
             twitch_channel_id=ch_twitch.id,
             yt_channel_id=ch_yt.id,
@@ -200,7 +200,6 @@ class CreatorCog(commands.Cog):
             lvl50_role_id=lvl50_role.id
         )
 
-        # 3. Deploy Human Verification Card in #✅・verify
         try:
             await ch_verify.purge(limit=10, check=lambda m: m.author == self.bot.user)
         except Exception:
@@ -209,17 +208,13 @@ class CreatorCog(commands.Cog):
             title=f"🛡️ {guild.name} — Security Verification Gate",
             description=(
                 "Welcome! To protect **AwwMian's Server** against automated bots and raids, please verify that you are human.\n\n"
-                "👉 **Click the green `✅ Verify Me (Human Check)` button below** to instantly unlock:\n"
-                f"• {ch_roles.mention} (Claim your VALORANT Agent, Pronouns, Colors & Twitter/Stream Pings)\n"
-                f"• {ch_twitter.mention}, {ch_memes.mention} & {ch_clips.mention} (Tweets, VALORANT/osu! clips & Memes)\n"
-                f"• {ch_feedback.mention} (Suggest new bot features & stream ideas)"
+                "👉 **Click the green `✅ Verify Me (Human Check)` button below** to instantly unlock the server!"
             ),
             color=discord.Color.from_rgb(46, 204, 113)
         )
         verify_embed.set_image(url="https://media1.tenor.com/m/ce9I2j28pI4AAAAd/anime-wave.gif")
         await ch_verify.send(embed=verify_embed, view=VerificationView())
 
-        # 4. RESTORED: Auto-post Rules Embed in #📜・rules if newly created or empty
         if rules_new or ch_rules.last_message_id is None:
             rules_embed = discord.Embed(
                 title=f"📜 {guild.name} — Official Server Rules",
@@ -228,34 +223,26 @@ class CreatorCog(commands.Cog):
                     "**1. Verify First** ✅\n"
                     f"Click the button in {ch_verify.mention} to unlock the server.\n\n"
                     "**2. Be Respectful & Chill** 🤝\n"
-                    "No harassment, hate speech, slurs, or toxicity. Friendly VALORANT/osu! banter is fine; personal attacks are not.\n\n"
-                    "**3. No Spam, Raids or Unauthorized Invites** 🚨\n"
-                    "Lil Mian's Anti-Raid & Auto-Mod will automatically timeout spammers and delete external server invite links.\n\n"
+                    "No harassment, hate speech, slurs, or toxicity.\n\n"
+                    "**3. No Spam or Invites** 🚨\n"
+                    "Auto-Mod will automatically timeout spammers and delete invite links.\n\n"
                     "**4. Keep Content Safe (Strict SFW)** 🛡️\n"
-                    "We have both `🔞 Adult` and `🌱 Minor` members. Keep all channels strictly SFW.\n\n"
+                    "Keep all channels strictly SFW.\n\n"
                     "**5. Grab Your Roles!** 🎭\n"
-                    f"Head over to {ch_roles.mention} to equip your **Pronouns, Name Color, VALORANT Main Agent, Twitter Pings & Stream Pings**!"
+                    f"Head over to {ch_roles.mention} to equip your roles!"
                 ),
                 color=discord.Color.from_rgb(219, 70, 145)
             )
             rules_embed.set_image(url="https://media1.tenor.com/m/wU6C2-kK2vUAAAAd/marin-kitagawa-anime-wave.gif")
             await ch_rules.send(embed=rules_embed)
 
-        # 5. Deploy Self-Roles Panels in #🎭・self-roles
         try:
             await ch_roles.purge(limit=10, check=lambda m: m.author == self.bot.user)
         except Exception:
             pass
         await deploy_all_role_panels(ch_roles)
 
-        await interaction.followup.send(
-            f"✅ **Full Server Setup Complete!**\n"
-            f"• **Security & Info:** {ch_verify.mention} (Grants {verified_role.mention}), {ch_rules.mention}, {ch_ann.mention}, {ch_joins.mention}, {ch_leaves.mention}\n"
-            f"• **Media Hub:** {ch_twitch.mention}, {ch_yt.mention}, {ch_shorts.mention}, {ch_twitter.mention} (Pings {twitter_ping.mention})\n"
-            f"• **Community Hub:** {ch_roles.mention}, {ch_memes.mention}, {ch_clips.mention}, {ch_feedback.mention}\n"
-            f"• **Economy Rebalanced:** Run `/reset_economy` to wipe old inflated balances back to `25 🌸`!",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"✅ **Super Server Setup Complete!** All channels, roles & panels deployed successfully.", ephemeral=True)
 
     @app_commands.command(name="keywords", description="[ADMIN/AWWMIAN ONLY] Live VALORANT & osu! viral trends + SNS keywords")
     @app_commands.default_permissions(administrator=True)
@@ -263,81 +250,52 @@ class CreatorCog(commands.Cog):
     async def keywords_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         trends = engine.get_sns_trends_and_keywords()
-        embed = discord.Embed(
-            title="🔥 VALORANT & osu! Viral Trends + Keywords",
-            description="Private Creator Intelligence for @awwmian:",
-            color=discord.Color.red()
-        )
+        embed = discord.Embed(title="🔥 VALORANT & osu! Viral Trends + Keywords", color=discord.Color.red())
         for platform, data in trends.items():
-            if platform == "Live Web & Gaming Surges":
-                embed.add_field(name="🌐 Live Search Surges (Japan / Global)", value=", ".join(data), inline=False)
-            else:
-                topics = "\n• ".join(data["viral_topics"])
-                kws = "`" + "`, `".join(data["keywords"]) + "`"
-                embed.add_field(name=f"📌 {platform}", value=f"**Trending Now:**\n• {topics}\n**Tags:** {kws}", inline=False)
+            if platform != "Live Web & Gaming Surges":
+                embed.add_field(name=f"📌 {platform}", value=f"**Tags:** `{'`, `'.join(data['keywords'])}`", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="ideas", description="[ADMIN/AWWMIAN ONLY] Generate AI VALORANT/osu! video ideas & 14-day predictions")
-    @app_commands.describe(focus="Specific agent, weapon, osu! beatmap, or challenge idea")
+    @app_commands.command(name="ideas", description="[ADMIN/AWWMIAN ONLY] Generate AI VALORANT/osu! video ideas")
     @app_commands.default_permissions(administrator=True)
     @is_awwmian_or_admin()
     async def ideas_cmd(self, interaction: discord.Interaction, focus: str = "VALORANT Ranked & osu! Handcam Clips"):
         await interaction.response.defer(ephemeral=True)
         report = engine.generate_ideas_and_predictions(focus)
-        embed = discord.Embed(
-            title=f"🧠 Lil Mian AI Strategist ({focus})",
-            description=report[:4000],
-            color=discord.Color.green()
-        )
+        embed = discord.Embed(title=f"🧠 AI Strategist ({focus})", description=report[:4000], color=discord.Color.green())
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="clip_idea", description="[ADMIN/AWWMIAN ONLY] Save a video/stream idea from phone/MacBook to Windows PC")
-    @app_commands.describe(idea="Type your video idea, hook, or clip timestamp note")
+    @app_commands.command(name="clip_idea", description="[ADMIN/AWWMIAN ONLY] Save video/stream idea to vault")
     @app_commands.default_permissions(administrator=True)
     @is_awwmian_or_admin()
     async def clip_idea_cmd(self, interaction: discord.Interaction, idea: str):
         engine.save_clip_idea(idea, source=f"Discord ({interaction.user.name})")
         await interaction.response.send_message(f"💾 **Saved to Vault!**\n> *{idea}*", ephemeral=True)
 
-    @app_commands.command(name="start_stream_prep", description="[ADMIN/AWWMIAN ONLY] Remotely launch Twitch Manager, YT Studio & OBS on Windows PC!")
+    @app_commands.command(name="start_stream_prep", description="[ADMIN/AWWMIAN ONLY] Launch Twitch Manager, YT Studio & OBS")
     @app_commands.default_permissions(administrator=True)
     @is_awwmian_or_admin()
     async def stream_prep_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         launched = engine.trigger_windows_stream_prep()
-        items = "\n• ".join(launched)
-        await interaction.followup.send(f"🖥️ **Windows PC Stream Prep Triggered!**\nLaunched on host PC:\n• {items}", ephemeral=True)
+        await interaction.followup.send(f"🖥️ **Stream Prep Triggered!**\nLaunched: {', '.join(launched)}", ephemeral=True)
 
-    # ==========================================
-    # PUBLIC COMMUNITY COMMANDS
-    # ==========================================
-    @app_commands.command(name="stats", description="Live telemetry for Twitch.tv/AwwMian, @NotAwwMian & @awwmianlive (JST)")
+    @app_commands.command(name="stats", description="Live telemetry for Twitch.tv/AwwMian")
     async def stats_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer()
         stats = engine.get_social_stats()
         sched = engine.get_next_stream_info()
-        embed = discord.Embed(
-            title="📊 Live Creator Telemetry — AwwMian",
-            url="https://twitch.tv/AwwMian",
-            color=discord.Color.purple()
-        )
+        embed = discord.Embed(title="📊 Live Creator Telemetry — AwwMian", url="https://twitch.tv/AwwMian", color=discord.Color.purple())
         embed.add_field(name="🟣 Twitch Status", value=f"**{stats['twitch_status']}**", inline=True)
         embed.add_field(name="👥 Twitch Followers", value=f"{stats['twitch_followers']:,}", inline=True)
-        embed.add_field(name="🎮 Category / Viewers", value=f"{stats['twitch_game']} ({stats['twitch_viewers']} watching)", inline=True)
-        embed.add_field(name="🔴 YouTube (@NotAwwMian)", value=f"**{stats['yt_subscribers']:,}** Subs\n`{stats['yt_total_views']:,}` Views ({stats['yt_video_count']} vids)", inline=True)
-        embed.add_field(name="📸 Instagram", value=f"[**{stats['ig_handle']}**](https://instagram.com/awwmianlive)", inline=True)
-        embed.add_field(name="⏰ Next Broadcast (JST)", value=f"**{sched['label']}**\n📅 `{sched['next_date']}`\n⏳ **{sched['countdown']}**", inline=False)
+        embed.add_field(name="🔴 YouTube", value=f"**{stats['yt_subscribers']:,}** Subs", inline=True)
+        embed.add_field(name="⏰ Next Broadcast", value=f"**{sched['label']}**\n⏳ `{sched['countdown']}`", inline=False)
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="schedule", description="Countdown to next Twitch.tv/AwwMian stream in Japan Time (JST / GMT+9)")
+    @app_commands.command(name="schedule", description="Next Twitch stream countdown (JST)")
     async def schedule_cmd(self, interaction: discord.Interaction):
         sched = engine.get_next_stream_info()
-        await interaction.response.send_message(
-            f"🎥 **Next Stream for Twitch.tv/AwwMian (JST / GMT+9):**\n"
-            f"> **{sched['label']}**\n"
-            f"> 📅 Date: `{sched['next_date']}`\n"
-            f"> ⏳ Countdown: **{sched['countdown']}**"
-        )
+        await interaction.response.send_message(f"🎥 **Next Stream:** {sched['label']} in **{sched['countdown']}**")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(CreatorCog(bot))
